@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { invokeFunction, supabase, DailyLimitError, FunctionError } from './supabase';
+import { invokeFunction, supabase, DailyLimitError, isSupabaseConfigured } from './supabase';
 import { parseQueryMock, PRESET_SPECS } from './mockParse';
 import { rankCandidates, DEFAULT_WEIGHTS, DEFAULT_SETTINGS } from './ranking';
 import { heuristicRank } from './heuristic';
@@ -100,6 +100,7 @@ export function useRecruiterSearch(
   }, [weights, settings, applyRanking]);
 
   const loadPastSearches = useCallback(async () => {
+    if (!supabase) return;
     const { data } = await supabase
       .from('searches')
       .select('id, query_text, preset, created_at')
@@ -114,6 +115,7 @@ export function useRecruiterSearch(
 
   const persistSearch = useCallback(
     async (spec: RoleSpec, hits: RetrievalHit[], jevResults: (JevCandidateResult & { candidate_id: string })[], ranked: RankedCandidate[], queryText: string, presetKey: string | null, cost: number) => {
+      if (!supabase) return null;
       const { data: searchData, error } = await supabase
         .from('searches')
         .insert({
@@ -167,7 +169,7 @@ export function useRecruiterSearch(
         let spec: RoleSpec;
         if (presetKey && PRESET_SPECS[presetKey]) {
           spec = PRESET_SPECS[presetKey];
-        } else if (llmMode === 'mock') {
+        } else if (llmMode === 'mock' || !supabase) {
           spec = parseQueryMock(queryText);
         } else {
           try {
@@ -192,6 +194,7 @@ export function useRecruiterSearch(
         let retriever_used: Retriever = retriever;
         let fallback_reason: string | null = null;
         try {
+          if (!supabase) throw new Error('Supabase is not configured.');
           const res = await invokeFunction<SearchResponse>('search', { query_spec: spec, query_text: queryText, retriever, k });
           hits = res.hits;
           retriever_used = res.retriever_used;
@@ -202,6 +205,11 @@ export function useRecruiterSearch(
             pushToast('Daily demo limit reached — switching to Replay mode.', 'info');
           } else {
             pushToast(`Retrieval failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
+            setRunning(false);
+            return;
+          }
+          if (!supabase) {
+            pushToast('No candidates available for local fallback.', 'error');
             setRunning(false);
             return;
           }
@@ -230,6 +238,7 @@ export function useRecruiterSearch(
         let heuristic = false;
         let jev_ms = 0;
         try {
+          if (!supabase) throw new Error('Supabase is not configured.');
           const res = await invokeFunction<JevResponse>('jev-rerank', {
             query_spec: spec,
             candidates: hits.map((h) => h.candidate),
@@ -308,6 +317,7 @@ export function useRecruiterSearch(
 
   const loadPastSearch = useCallback(
     async (searchId: string) => {
+      if (!supabase) return;
       setRunning(true);
       try {
         const [{ data: sRow }, { data: rRows }] = await Promise.all([
@@ -366,7 +376,7 @@ export function useRecruiterSearch(
       const spec = specRef.current;
       const row = rankedRef.current.find((r) => r.candidate.id === candidateId);
       if (!spec || !row) return null;
-      if (llmMode === 'live') {
+      if (llmMode === 'live' && supabase) {
         try {
           const res = await invokeFunction<ExplainResponse>('explain', {
             query_spec: spec,

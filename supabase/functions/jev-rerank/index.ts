@@ -4,6 +4,7 @@ import { totalYears } from "./ranking.ts";
 
 const DAILY_LIMIT = 200;
 const FN_NAME = "jev-rerank";
+const MAX_CANDIDATES = 40;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -25,8 +26,15 @@ async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Re
   return null;
 }
 
+class DailyLimitStop extends Error {
+  constructor() {
+    super("daily_limit");
+    this.name = "DailyLimitStop";
+  }
+}
+
 const JEV_MODEL = "jev-1.13.0";
-const COST_PER_INPUT_TOKEN = 0.042 / 1_000_000; // USD; output tokens are free
+const COST_PER_INPUT_TOKEN = 0.042 / 1_000_000;
 
 function buildState(spec: RoleSpec, c: Candidate): JevState {
   const years = totalYears(c);
@@ -39,7 +47,6 @@ function buildState(spec: RoleSpec, c: Candidate): JevState {
       location: spec.location.text || `${spec.location.remote}`,
       domain: spec.domain,
     },
-    // Only fields the questions need. Never send name, email, photo, age, gender, or school names.
     candidate: {
       headline: c.headline,
       skills: c.skills,
@@ -120,10 +127,16 @@ function buildQuestions(spec: RoleSpec) {
   return questions;
 }
 
-async function callJev(request: unknown, apiKey: string): Promise<Response> {
+async function callJev(
+  request: unknown,
+  apiKey: string,
+  supabase: ReturnType<typeof createClient>,
+): Promise<Response> {
   const base = "https://api.typesafe.ai/v1/systemone";
   let delay = 500;
   for (let attempt = 0; attempt < 3; attempt++) {
+    const usageResponse = await checkUsage(supabase);
+    if (usageResponse) throw new DailyLimitStop();
     const res = await fetch(base, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -145,12 +158,13 @@ async function rerankOne(
   spec: RoleSpec,
   c: Candidate,
   apiKey: string,
+  supabase: ReturnType<typeof createClient>,
 ): Promise<JevCandidateResult> {
   const state = buildState(spec, c);
   const questions = buildQuestions(spec);
   const request = { model: JEV_MODEL, state, questions };
   const started = performance.now();
-  const res = await callJev(request, apiKey);
+  const res = await callJev(request, apiKey, supabase);
   const latency_ms = Math.round(performance.now() - started);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -167,16 +181,22 @@ async function rerankOne(
   };
 }
 
-async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+async function pool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+  shouldStop: () => boolean,
+): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = new Array(items.length);
   let next = 0;
   async function worker() {
-    while (next < items.length) {
+    while (!shouldStop() && next < items.length) {
       const i = next++;
       try {
         results[i] = { status: "fulfilled", value: await fn(items[i]) };
       } catch (e) {
         results[i] = { status: "rejected", reason: e };
+        if (e instanceof DailyLimitStop) break;
       }
     }
   }
@@ -193,17 +213,28 @@ Deno.serve(async (req: Request) => {
     const { query_spec, candidates } = await req.json();
     if (!query_spec || !Array.isArray(candidates)) return err("query_spec and candidates[] are required", 422);
     if (candidates.length === 0) return err("candidates[] is empty", 422);
+    if (candidates.length > MAX_CANDIDATES) return json({ error: "too_many_candidates" }, 422);
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    const usageResponse = await checkUsage(supabase);
-    if (usageResponse) return usageResponse;
-
+    let stopped = false;
     const started = performance.now();
-    const settled = await pool(candidates as Candidate[], 8, (c) => rerankOne(query_spec, c, apiKey));
+    const settled = await pool(
+      candidates as Candidate[],
+      8,
+      (c) => rerankOne(query_spec, c, apiKey, supabase),
+      () => stopped,
+    );
+
+    const dailyLimitHit = settled.some(
+      (r) => r.status === "rejected" && r.reason instanceof DailyLimitStop,
+    );
+    if (dailyLimitHit) {
+      return json({ error: "daily_limit" }, 429);
+    }
 
     const results: (JevCandidateResult & { candidate_id: string })[] = [];
     const errors: string[] = [];

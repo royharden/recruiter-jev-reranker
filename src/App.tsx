@@ -10,7 +10,7 @@ import { PipelineStrip } from '@/components/PipelineStrip';
 import { useRecruiterSearch } from '@/lib/useRecruiterSearch';
 import { PRESET_QUERIES, PRESET_SPECS } from '@/lib/mockParse';
 import { DEFAULT_SETTINGS } from '@/lib/ranking';
-import { DailyLimitError } from '@/lib/supabase';
+import { DailyLimitError, isSupabaseConfigured } from '@/lib/supabase';
 import type { Retriever, LlmMode, RoleSpec, Weights, RankSettings, RankedCandidate } from '@/lib/types';
 import type { Job } from '@/lib/jobs';
 
@@ -106,6 +106,7 @@ function AppInner() {
 
   useMemo(() => {
     import('@/lib/supabase').then(async ({ supabase }) => {
+      if (!supabase) return;
       const { data } = await supabase.from('jobs').select('*').order('created_at');
       if (data) setJobs(data as Job[]);
     }).catch(() => {});
@@ -120,7 +121,11 @@ function AppInner() {
   const buildEmbeddings = useCallback(async () => {
     setBuildEmbedsBusy(true);
     try {
-      const { invokeFunction } = await import('@/lib/supabase');
+      const { invokeFunction, supabase } = await import('@/lib/supabase');
+      if (!supabase) {
+        push('Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to use this feature.', 'error');
+        return;
+      }
       const res = await invokeFunction<{ embedded: number; skipped: number; message?: string }>('embed-candidates', {});
       push(res.message ?? `Embedded ${res.embedded} candidate(s)${res.skipped ? `, skipped ${res.skipped} existing` : ''}.`, 'success');
     } catch (e) {
@@ -136,6 +141,14 @@ function AppInner() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
+      {!isSupabaseConfigured && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-3 text-center">
+          <p className="text-sm text-amber-800">
+            Supabase is not configured. Set <code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">VITE_SUPABASE_URL</code> and{' '}
+            <code className="font-mono text-xs bg-amber-100 px-1 py-0.5 rounded">VITE_SUPABASE_ANON_KEY</code> in your environment to enable live search. The app runs in Replay mode until then.
+          </p>
+        </div>
+      )}
       {/* Hero */}
       <header className="border-b border-slate-200 bg-white">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8">

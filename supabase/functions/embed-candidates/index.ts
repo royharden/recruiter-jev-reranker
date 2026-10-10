@@ -8,7 +8,7 @@ const FN_NAME = "embed-candidates";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, x-admin-token",
 };
 
 function json(body: unknown, status = 200) {
@@ -47,6 +47,11 @@ async function embed(text: string): Promise<number[] | null> {
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
   try {
+    const adminToken = Deno.env.get("ADMIN_TOKEN");
+    if (!adminToken) return err("ADMIN_TOKEN secret is not configured", 500);
+    const provided = req.headers.get("x-admin-token");
+    if (!provided || provided !== adminToken) return err("unauthorized", 401);
+
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
@@ -66,7 +71,6 @@ Deno.serve(async (req: Request) => {
 
     let embedded = 0;
     const failures: string[] = [];
-    // Embed sequentially to keep the OpenAI call simple and rate-limit friendly at 40 rows.
     for (const c of toEmbed) {
       const vec = await embed(candidateDocument(c));
       if (!vec) {
