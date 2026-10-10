@@ -10,6 +10,7 @@ import { PipelineStrip } from '@/components/PipelineStrip';
 import { useRecruiterSearch } from '@/lib/useRecruiterSearch';
 import { PRESET_QUERIES, PRESET_SPECS } from '@/lib/mockParse';
 import { DEFAULT_SETTINGS } from '@/lib/ranking';
+import { DailyLimitError } from '@/lib/supabase';
 import type { Retriever, LlmMode, RoleSpec, Weights, RankSettings, RankedCandidate } from '@/lib/types';
 import type { Job } from '@/lib/jobs';
 
@@ -123,10 +124,11 @@ function AppInner() {
       const res = await invokeFunction<{ embedded: number; skipped: number; message?: string }>('embed-candidates', {});
       push(res.message ?? `Embedded ${res.embedded} candidate(s)${res.skipped ? `, skipped ${res.skipped} existing` : ''}.`, 'success');
     } catch (e) {
-      const msg = e instanceof Error && e.message === 'daily_limit'
-        ? 'Daily demo limit reached for embed-candidates. Try again tomorrow.'
-        : `Build embeddings failed: ${e instanceof Error ? e.message : 'error'}`;
-      push(msg, e instanceof Error && e.message === 'daily_limit' ? 'info' : 'error');
+      if (e instanceof DailyLimitError) {
+        push('Daily demo limit reached for embed-candidates. Try again tomorrow.', 'info');
+      } else {
+        push(`Build embeddings failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
+      }
     } finally {
       setBuildEmbedsBusy(false);
     }

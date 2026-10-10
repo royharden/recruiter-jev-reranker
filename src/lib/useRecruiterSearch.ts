@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { invokeFunction, supabase, DailyLimitError } from './supabase';
+import { invokeFunction, supabase, DailyLimitError, FunctionError } from './supabase';
 import { parseQueryMock, PRESET_SPECS } from './mockParse';
 import { rankCandidates, DEFAULT_WEIGHTS, DEFAULT_SETTINGS } from './ranking';
 import { heuristicRank } from './heuristic';
@@ -61,7 +61,6 @@ export function useRecruiterSearch(
   const [running, setRunning] = useState(false);
   const [pastSearches, setPastSearches] = useState<PastSearch[]>([]);
 
-  // Store ranked results so slider moves can re-rank without refetching.
   const rankedRef = useRef<RankedCandidate[]>([]);
   const specRef = useRef<RoleSpec | null>(null);
   const metaRef = useRef<{ searchId: string | null; timings: StageTimings; cost: number; calls: number; heuristic: boolean; hits: RetrievalHit[]; retriever_used: Retriever; fallback: string | null }>({
@@ -72,7 +71,6 @@ export function useRecruiterSearch(
     const spec = specRef.current;
     if (!spec) return;
     const answersPerCandidate = rankedRef.current;
-    // Re-rank from stored per-candidate answers
     const inputs = answersPerCandidate.map((r) => ({
       hit: { candidate_id: r.candidate.id, retrieval_rank: r.retrieval_rank, retrieval_score: r.retrieval_score, candidate: r.candidate },
       answers: r.answers,
@@ -97,7 +95,6 @@ export function useRecruiterSearch(
     });
   }, [weights, settings]);
 
-  // Re-rank instantly on weight/settings change (no new API calls).
   useEffect(() => {
     if (rankedRef.current.length && specRef.current) applyRanking();
   }, [weights, settings, applyRanking]);
@@ -179,9 +176,9 @@ export function useRecruiterSearch(
             if (res.mode === 'mock_fallback') pushToast('LLM unavailable — used the rule-based parser instead.', 'info');
           } catch (e) {
             if (e instanceof DailyLimitError) {
-              pushToast('Daily demo limit reached for parse-query — using the rule-based parser.', 'info');
+              pushToast('Daily demo limit reached — switching to Replay mode.', 'info');
             } else {
-              pushToast(`Query parse failed (${e instanceof Error ? e.message : 'error'}) — used the rule-based parser.`, 'error');
+              pushToast(`Query parse failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
             }
             spec = parseQueryMock(queryText);
           }
@@ -202,11 +199,12 @@ export function useRecruiterSearch(
           if (res.fallback_reason) pushToast(res.fallback_reason, 'info');
         } catch (e) {
           if (e instanceof DailyLimitError) {
-            pushToast('Daily demo limit reached for search — using local BM25 instead.', 'info');
+            pushToast('Daily demo limit reached — switching to Replay mode.', 'info');
           } else {
             pushToast(`Retrieval failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
+            setRunning(false);
+            return;
           }
-          // Fall back to client-side BM25 using seeded candidates from Supabase
           const { data: candRows } = await supabase.from('candidates').select('*');
           if (!candRows || candRows.length === 0) {
             pushToast('No candidates available for local fallback.', 'error');
@@ -226,7 +224,7 @@ export function useRecruiterSearch(
         }
         const search_ms = Math.round(performance.now() - searchStart);
 
-        // Stage 3: Jev fan-out (one request per shortlisted candidate)
+        // Stage 3: Jev fan-out
         const jevStart = performance.now();
         let jevResults: (JevCandidateResult & { candidate_id: string })[] = [];
         let heuristic = false;
@@ -240,9 +238,9 @@ export function useRecruiterSearch(
           if (res.errors?.length) pushToast(`${res.errors.length} candidate(s) failed to rerank; others succeeded.`, 'info');
         } catch (e) {
           if (e instanceof DailyLimitError) {
-            pushToast('Daily demo limit reached for Jev — showing heuristic scores instead (not Jev).', 'info');
+            pushToast('Daily demo limit reached — showing heuristic scores instead (not Jev).', 'info');
           } else {
-            pushToast(`Jev unreachable (${e instanceof Error ? e.message : 'error'}). Showing a labeled heuristic score instead — not Jev.`, 'error');
+            pushToast(`Jev unreachable: ${e instanceof Error ? e.message : 'error'}. Showing heuristic scores instead — not Jev.`, 'error');
           }
           heuristic = true;
         }
@@ -285,7 +283,6 @@ export function useRecruiterSearch(
           heuristic,
         });
 
-        // Persist asynchronously
         (async () => {
           const searchId = await persistSearch(spec, hits, jevResults, ranked, queryText, presetKey, cost);
           if (searchId) {
@@ -304,7 +301,6 @@ export function useRecruiterSearch(
   const rerankWithEditedSpec = useCallback(
     async (spec: RoleSpec, queryText: string) => {
       specRef.current = spec;
-      // Re-run Jev with the edited spec against the same shortlist.
       await runSearch(queryText, null);
     },
     [runSearch],
@@ -390,12 +386,13 @@ export function useRecruiterSearch(
           return res.explanation;
         } catch (e) {
           if (e instanceof DailyLimitError) return null;
+          pushToast(`Explanation failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
           return null;
         }
       }
       return null;
     },
-    [llmMode],
+    [llmMode, pushToast],
   );
 
   return { state, running, pastSearches, runSearch, rerankWithEditedSpec, loadPastSearch, loadPastSearches, fetchExplanation, setState };

@@ -18,10 +18,11 @@ function err(message: string, status = 500) {
   return json({ error: message }, status);
 }
 
-async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<boolean> {
+async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Response | null> {
   const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
-  if (error) return true;
-  return (data as number) <= DAILY_LIMIT;
+  if (error || typeof data !== "number") return json({ error: "usage_check_failed" }, 503);
+  if (data > DAILY_LIMIT) return json({ error: "daily_limit" }, 429);
+  return null;
 }
 
 const JEV_MODEL = "jev-1.13.0";
@@ -198,8 +199,8 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    const allowed = await checkUsage(supabase);
-    if (!allowed) return json({ error: "daily_limit" }, 429);
+    const usageResponse = await checkUsage(supabase);
+    if (usageResponse) return usageResponse;
 
     const started = performance.now();
     const settled = await pool(candidates as Candidate[], 8, (c) => rerankOne(query_spec, c, apiKey));
