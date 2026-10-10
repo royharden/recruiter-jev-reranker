@@ -123,7 +123,10 @@ function AppInner() {
       const res = await invokeFunction<{ embedded: number; skipped: number; message?: string }>('embed-candidates', {});
       push(res.message ?? `Embedded ${res.embedded} candidate(s)${res.skipped ? `, skipped ${res.skipped} existing` : ''}.`, 'success');
     } catch (e) {
-      push(`Build embeddings failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
+      const msg = e instanceof Error && e.message === 'daily_limit'
+        ? 'Daily demo limit reached for embed-candidates. Try again tomorrow.'
+        : `Build embeddings failed: ${e instanceof Error ? e.message : 'error'}`;
+      push(msg, e instanceof Error && e.message === 'daily_limit' ? 'info' : 'error');
     } finally {
       setBuildEmbedsBusy(false);
     }

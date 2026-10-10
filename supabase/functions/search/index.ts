@@ -2,6 +2,9 @@ import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import type { Candidate, RoleSpec, RetrievalHit } from "./types.ts";
 import { Bm25Index } from "./bm25.ts";
 
+const DAILY_LIMIT = 200;
+const FN_NAME = "search";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -14,6 +17,12 @@ function json(body: unknown, status = 200) {
 
 function err(message: string, status = 500) {
   return json({ error: message }, status);
+}
+
+async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<boolean> {
+  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
+  if (error) return true; // fail open if counter unavailable
+  return (data as number) <= DAILY_LIMIT;
 }
 
 async function embed(text: string): Promise<number[] | null> {
@@ -56,6 +65,10 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
+
+    const allowed = await checkUsage(supabase);
+    if (!allowed) return json({ error: "daily_limit" }, 429);
+
     const { data: rows, error } = await supabase.from("candidates").select("*");
     if (error) return err(`database error: ${error.message}`, 500);
     const candidates = rows as Candidate[];
@@ -137,4 +150,3 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-// touch: force redeploy to clear verify_jwt from earlier deploy

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { invokeFunction, supabase } from './supabase';
+import { invokeFunction, supabase, DailyLimitError } from './supabase';
 import { parseQueryMock, PRESET_SPECS } from './mockParse';
 import { rankCandidates, DEFAULT_WEIGHTS, DEFAULT_SETTINGS } from './ranking';
 import { heuristicRank } from './heuristic';
@@ -178,7 +178,11 @@ export function useRecruiterSearch(
             spec = res.spec;
             if (res.mode === 'mock_fallback') pushToast('LLM unavailable — used the rule-based parser instead.', 'info');
           } catch (e) {
-            pushToast(`Query parse failed (${e instanceof Error ? e.message : 'error'}) — used the rule-based parser.`, 'error');
+            if (e instanceof DailyLimitError) {
+              pushToast('Daily demo limit reached for parse-query — using the rule-based parser.', 'info');
+            } else {
+              pushToast(`Query parse failed (${e instanceof Error ? e.message : 'error'}) — used the rule-based parser.`, 'error');
+            }
             spec = parseQueryMock(queryText);
           }
         }
@@ -197,9 +201,28 @@ export function useRecruiterSearch(
           fallback_reason = res.fallback_reason;
           if (res.fallback_reason) pushToast(res.fallback_reason, 'info');
         } catch (e) {
-          pushToast(`Retrieval failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
-          setRunning(false);
-          return;
+          if (e instanceof DailyLimitError) {
+            pushToast('Daily demo limit reached for search — using local BM25 instead.', 'info');
+          } else {
+            pushToast(`Retrieval failed: ${e instanceof Error ? e.message : 'error'}`, 'error');
+          }
+          // Fall back to client-side BM25 using seeded candidates from Supabase
+          const { data: candRows } = await supabase.from('candidates').select('*');
+          if (!candRows || candRows.length === 0) {
+            pushToast('No candidates available for local fallback.', 'error');
+            setRunning(false);
+            return;
+          }
+          const { Bm25Index } = await import('./bm25');
+          const index = new Bm25Index(candRows as import('./types').Candidate[]);
+          const bm25Hits = index.search(`${queryText} ${spec.must_have.join(' ')}`, candRows.length);
+          hits = bm25Hits.slice(0, k).map((h, i) => ({
+            candidate_id: h.candidate_id,
+            retrieval_rank: i + 1,
+            retrieval_score: h.score,
+            candidate: (candRows as import('./types').Candidate[]).find((c) => c.id === h.candidate_id)!,
+          }));
+          fallback_reason = 'Daily limit reached — using client-side BM25.';
         }
         const search_ms = Math.round(performance.now() - searchStart);
 
@@ -216,7 +239,11 @@ export function useRecruiterSearch(
           jevResults = res.results;
           if (res.errors?.length) pushToast(`${res.errors.length} candidate(s) failed to rerank; others succeeded.`, 'info');
         } catch (e) {
-          pushToast(`Jev unreachable (${e instanceof Error ? e.message : 'error'}). Showing a labeled heuristic score instead — not Jev.`, 'error');
+          if (e instanceof DailyLimitError) {
+            pushToast('Daily demo limit reached for Jev — showing heuristic scores instead (not Jev).', 'info');
+          } else {
+            pushToast(`Jev unreachable (${e instanceof Error ? e.message : 'error'}). Showing a labeled heuristic score instead — not Jev.`, 'error');
+          }
           heuristic = true;
         }
         jev_ms = heuristic ? 0 : Math.round(performance.now() - jevStart);
@@ -361,7 +388,8 @@ export function useRecruiterSearch(
             llm_mode: llmMode,
           });
           return res.explanation;
-        } catch {
+        } catch (e) {
+          if (e instanceof DailyLimitError) return null;
           return null;
         }
       }

@@ -1,5 +1,9 @@
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import type { Candidate, JevCandidateResult, JevState, RoleSpec } from "./types.ts";
 import { totalYears } from "./ranking.ts";
+
+const DAILY_LIMIT = 200;
+const FN_NAME = "jev-rerank";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,6 +16,12 @@ function json(body: unknown, status = 200) {
 }
 function err(message: string, status = 500) {
   return json({ error: message }, status);
+}
+
+async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<boolean> {
+  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
+  if (error) return true;
+  return (data as number) <= DAILY_LIMIT;
 }
 
 const JEV_MODEL = "jev-1.13.0";
@@ -182,6 +192,14 @@ Deno.serve(async (req: Request) => {
     const { query_spec, candidates } = await req.json();
     if (!query_spec || !Array.isArray(candidates)) return err("query_spec and candidates[] are required", 422);
     if (candidates.length === 0) return err("candidates[] is empty", 422);
+
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    );
+
+    const allowed = await checkUsage(supabase);
+    if (!allowed) return json({ error: "daily_limit" }, 429);
 
     const started = performance.now();
     const settled = await pool(candidates as Candidate[], 8, (c) => rerankOne(query_spec, c, apiKey));

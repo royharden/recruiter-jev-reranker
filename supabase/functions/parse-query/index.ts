@@ -2,6 +2,9 @@ import { z } from "npm:zod@3.23.8";
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { parseQueryMock } from "./mockParse.ts";
 
+const DAILY_LIMIT = 200;
+const FN_NAME = "parse-query";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -13,6 +16,12 @@ function json(body: unknown, status = 200) {
 }
 function err(message: string, status = 500) {
   return json({ error: message }, status);
+}
+
+async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<boolean> {
+  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
+  if (error) return true;
+  return (data as number) <= DAILY_LIMIT;
 }
 
 const roleSpecSchema = z.object({
@@ -84,6 +93,14 @@ Deno.serve(async (req: Request) => {
     const { query_text, llm_mode = "live" } = await req.json();
     if (!query_text) return err("query_text is required", 422);
 
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    );
+
+    const allowed = await checkUsage(supabase);
+    if (!allowed) return json({ error: "daily_limit" }, 429);
+
     if (llm_mode === "mock") {
       return json({ spec: parseQueryMock(queryText), mode: "mock" });
     }
@@ -98,5 +115,3 @@ Deno.serve(async (req: Request) => {
     return err(e instanceof Error ? e.message : "unknown error");
   }
 });
-
-// touch: force redeploy to clear verify_jwt from earlier deploy
