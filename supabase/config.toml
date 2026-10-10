@@ -1,0 +1,16 @@
+project_id = "recruiter-search"
+
+[functions.search]
+verify_jwt = false
+
+[functions.parse-query]
+verify_jwt = false
+
+[functions.jev-rerank]
+verify_jwt = false
+
+[functions.explain]
+verify_jwt = false
+
+[functions.embed-candidates]
+verify_jwt = false
