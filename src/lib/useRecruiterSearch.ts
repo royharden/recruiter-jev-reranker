@@ -241,7 +241,7 @@ export function useRecruiterSearch(
           if (!supabase) throw new Error('Supabase is not configured.');
           const res = await invokeFunction<JevResponse>('jev-rerank', {
             query_spec: spec,
-            candidates: hits.map((h) => h.candidate),
+            candidate_ids: hits.map((h) => h.candidate_id),
           });
           jevResults = res.results;
           if (res.errors?.length) pushToast(`${res.errors.length} candidate(s) failed to rerank; others succeeded.`, 'info');

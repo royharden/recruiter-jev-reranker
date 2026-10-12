@@ -10,7 +10,7 @@ const STOP_WORDS = new Set([
 export interface Bm25Doc {
   candidate_id: string;
   tokens: string[];
-  term_freqs: Map<string, number>;
+  termFreqs: Map<string, number>;
   length: number;
 }
 

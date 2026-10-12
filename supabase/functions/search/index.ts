@@ -1,9 +1,12 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
-import type { Candidate, RoleSpec, RetrievalHit } from "./types.ts";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+import { z } from "npm:zod@3.23.8";
+import type { Candidate, RetrievalHit } from "./types.ts";
 import { Bm25Index } from "./bm25.ts";
+import { checkUsage, HttpError, MAX_QUERY_CHARS, readJsonBody, serviceClient } from "./guards.ts";
+import { invalidField, roleSpecSchema } from "./spec.ts";
 
-const DAILY_LIMIT = 200;
 const FN_NAME = "search";
+const EMBEDDING_DIMS = 1536;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,28 +22,36 @@ function err(message: string, status = 500) {
   return json({ error: message }, status);
 }
 
-async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Response | null> {
-  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
-  if (error || typeof data !== "number") return json({ error: "usage_check_failed" }, 503);
-  if (data > DAILY_LIMIT) return json({ error: "daily_limit" }, 429);
-  return null;
-}
+const bodySchema = z.object({
+  query_spec: roleSpecSchema,
+  query_text: z.string().min(1).max(MAX_QUERY_CHARS),
+  retriever: z.enum(["bm25", "embeddings", "hybrid"]).default("bm25"),
+  k: z.number().int().min(1).max(40).default(20),
+});
 
-async function embed(text: string): Promise<number[] | null> {
+// Counts the call against the daily cap right before the paid fetch; a cap hit or failed
+// usage check throws HttpError so the caller stops immediately.
+async function embed(supabase: SupabaseClient, text: string): Promise<number[] | null> {
   const key = Deno.env.get("OPENAI_API_KEY");
   if (!key) return null;
   const base = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
   const model = Deno.env.get("OPENAI_EMBEDDING_MODEL") ?? "text-embedding-3-small";
+  await checkUsage(supabase, FN_NAME);
   try {
     const res = await fetch(`${base}/embeddings`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model, input: text }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[${FN_NAME}] embeddings error ${res.status}: ${(await res.text().catch(() => "")).slice(0, 500)}`);
+      return null;
+    }
     const data = await res.json();
-    return data?.data?.[0]?.embedding ?? null;
-  } catch {
+    const vec = data?.data?.[0]?.embedding;
+    return Array.isArray(vec) && vec.length === EMBEDDING_DIMS && vec.every(Number.isFinite) ? vec : null;
+  } catch (e) {
+    console.error(`[${FN_NAME}] embeddings request failed:`, e);
     return null;
   }
 }
@@ -57,21 +68,21 @@ function rrf(lists: { candidate_id: string }[][], k: number): Map<string, number
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
+  const supabase = serviceClient();
+  if (!supabase) return err("server_not_configured", 503);
   try {
-    const { query_spec, query_text, retriever = "bm25", k = 20 } = await req.json();
-    if (!query_text || !query_spec) return err("query_text and query_spec are required", 422);
-    if (!["bm25", "embeddings", "hybrid"].includes(retriever)) return err("retriever must be bm25 | embeddings | hybrid", 422);
-
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
-
-    const usageResponse = await checkUsage(supabase);
-    if (usageResponse) return usageResponse;
+    const raw = await readJsonBody(req);
+    const queryText = (raw as { query_text?: unknown } | null)?.query_text;
+    if (typeof queryText === "string" && queryText.length > MAX_QUERY_CHARS) return err("query_text_too_long", 413);
+    const body = bodySchema.safeParse(raw);
+    if (!body.success) return err(invalidField(body.error), 422);
+    const { query_spec, query_text, retriever, k } = body.data;
 
     const { data: rows, error } = await supabase.from("candidates").select("*");
-    if (error) return err(`database error: ${error.message}`, 500);
+    if (error) {
+      console.error(`[${FN_NAME}] candidates query failed: ${error.message}`);
+      return err("database_error", 500);
+    }
     const candidates = rows as Candidate[];
 
     const started = performance.now();
@@ -92,7 +103,7 @@ Deno.serve(async (req: Request) => {
 
     if (wantsEmbed) {
       const doc = `${query_text} ${query_spec.must_have.join(" ")} ${query_spec.nice_to_have.join(" ")}`;
-      const vec = await embed(doc);
+      const vec = await embed(supabase, doc);
       if (!vec) {
         fallback_reason = "Embeddings unavailable (missing OPENAI_API_KEY, no stored vectors, or embedding call failed) — fell back to BM25.";
         if (retriever === "embeddings") retriever_used = "bm25";
@@ -106,7 +117,8 @@ Deno.serve(async (req: Request) => {
           match_count: Math.min(candidates.length, 40),
         });
         if (rpcError || !matches) {
-          fallback_reason = `Embedding search failed: ${rpcError?.message ?? "no matches"} — fell back to BM25.`;
+          if (rpcError) console.error(`[${FN_NAME}] match_candidates failed: ${rpcError.message}`);
+          fallback_reason = "Embedding search failed — fell back to BM25.";
           if (retriever === "embeddings") retriever_used = "bm25";
         } else {
           // cosine distance (0 = identical) -> similarity score
@@ -147,7 +159,8 @@ Deno.serve(async (req: Request) => {
       latency_ms: Math.round(performance.now() - started),
     });
   } catch (e) {
-    return err(e instanceof Error ? e.message : "unknown error");
+    if (e instanceof HttpError) return err(e.message, e.status);
+    console.error(`[${FN_NAME}] unhandled error:`, e);
+    return err("internal_error");
   }
 });
-

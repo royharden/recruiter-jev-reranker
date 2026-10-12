@@ -47,6 +47,8 @@ supabase secrets set TYPESAFE_API_KEY=sk-... OPENAI_API_KEY=sk-... OPENAI_MODEL=
 | `OPENAI_MODEL` | Edge Function secret | Default `gpt-6-luna`; never sent a temperature |
 | `OPENAI_BASE_URL` | Edge Function secret | Default `https://api.openai.com/v1` |
 | `OPENAI_EMBEDDING_MODEL` | Edge Function secret (optional) | Default `text-embedding-3-small` |
+| `ADMIN_TOKEN` | Edge Function secret | Required by `embed-candidates` (sent as `x-admin-token`; the app prompts for it when you click **Build embeddings**) |
+| `DAILY_CALL_LIMIT` | Edge Function secret (optional) | Paid upstream calls per function per UTC day, default `200` |
 | `VITE_SUPABASE_URL` | Browser env | Public Supabase URL |
 | `VITE_SUPABASE_ANON_KEY` | Browser env | Public anon key |
 
@@ -65,7 +67,7 @@ All 40 candidates, all companies (Northwind Labs, Lumen Health, Brightpath, Coba
 
 ## Design decisions
 
-- **One fan-out request per candidate** (concurrency 8, retries with exponential backoff on 429/529) — latency scales with the shortlist, not the database.
+- **One fan-out request per candidate** (concurrency 8, at most 2 attempts, retrying only on 429/529 or a network error) — latency scales with the shortlist, not the database.
 - **One Noul per skill** (`must_0`…`must_5`, `nice_0`…`nice_3`) — atomic, literal questions.
 - **Expected values over probabilities** instead of argmax (seniority `matches`=1.0, `above`=0.6, `below`=0.25, `uncertain`=0.5 by default; location `works_now`=1.0, `relocate`=0.7, `mismatch`=0, `uncertain`=0.5).
 - **Years and timezone overlap are computed in code** (overlapping experience ranges merged; <3h overlap caps the location sub-score at 0.4 with a "Timezone" chip).

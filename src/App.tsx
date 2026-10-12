@@ -126,7 +126,12 @@ function AppInner() {
         push('Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to use this feature.', 'error');
         return;
       }
-      const res = await invokeFunction<{ embedded: number; skipped: number; message?: string }>('embed-candidates', {});
+      // Admin-only action: the token is typed in at click time and never stored or bundled.
+      const adminToken = window.prompt('Admin token (the ADMIN_TOKEN Edge Function secret):');
+      if (!adminToken) return;
+      const res = await invokeFunction<{ embedded: number; skipped: number; message?: string }>(
+        'embed-candidates', {}, { 'x-admin-token': adminToken },
+      );
       push(res.message ?? `Embedded ${res.embedded} candidate(s)${res.skipped ? `, skipped ${res.skipped} existing` : ''}.`, 'success');
     } catch (e) {
       if (e instanceof DailyLimitError) {
@@ -202,6 +207,7 @@ function AppInner() {
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && doSearch()}
+                  maxLength={2000}
                   placeholder="Describe the role, or paste a job posting…"
                   className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 />

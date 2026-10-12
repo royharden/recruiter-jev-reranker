@@ -1,9 +1,10 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import type { Candidate } from "./types.ts";
 import { candidateDocument } from "./bm25.ts";
+import { checkUsage, HttpError, readJsonBody, serviceClient } from "./guards.ts";
 
-const DAILY_LIMIT = 200;
 const FN_NAME = "embed-candidates";
+const EMBEDDING_DIMS = 1536;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -18,50 +19,65 @@ function err(message: string, status = 500) {
   return json({ error: message }, status);
 }
 
-async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Response | null> {
-  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
-  if (error || typeof data !== "number") return json({ error: "usage_check_failed" }, 503);
-  if (data > DAILY_LIMIT) return json({ error: "daily_limit" }, 429);
-  return null;
+// Constant-time comparison of the x-admin-token header against the ADMIN_TOKEN secret.
+async function adminTokenMatches(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(provided)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
 }
 
-async function embed(text: string): Promise<number[] | null> {
+// One paid call per candidate: the daily cap is checked right before each fetch, and a cap
+// hit or failed usage check throws HttpError so the loop stops immediately.
+async function embed(supabase: SupabaseClient, text: string): Promise<number[] | null> {
   const key = Deno.env.get("OPENAI_API_KEY");
   if (!key) return null;
   const base = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
   const model = Deno.env.get("OPENAI_EMBEDDING_MODEL") ?? "text-embedding-3-small";
+  await checkUsage(supabase, FN_NAME);
   try {
     const res = await fetch(`${base}/embeddings`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model, input: text }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[${FN_NAME}] embeddings error ${res.status}: ${(await res.text().catch(() => "")).slice(0, 500)}`);
+      return null;
+    }
     const data = await res.json();
-    return data?.data?.[0]?.embedding ?? null;
-  } catch {
+    const vec = data?.data?.[0]?.embedding;
+    return Array.isArray(vec) && vec.length === EMBEDDING_DIMS && vec.every(Number.isFinite) ? vec : null;
+  } catch (e) {
+    console.error(`[${FN_NAME}] embeddings request failed:`, e);
     return null;
   }
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
+  const supabase = serviceClient();
+  if (!supabase) return err("server_not_configured", 503);
+  let embedded = 0;
   try {
     const adminToken = Deno.env.get("ADMIN_TOKEN");
-    if (!adminToken) return err("ADMIN_TOKEN secret is not configured", 500);
+    if (!adminToken) console.error(`[${FN_NAME}] ADMIN_TOKEN secret is not configured`);
     const provided = req.headers.get("x-admin-token");
-    if (!provided || provided !== adminToken) return err("unauthorized", 401);
+    if (!adminToken || !provided || !(await adminTokenMatches(provided, adminToken))) return err("unauthorized", 401);
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
-
-    const usageResponse = await checkUsage(supabase);
-    if (usageResponse) return usageResponse;
+    await readJsonBody(req);
 
     const { data: rows, error } = await supabase.from("candidates").select("*");
-    if (error) return err(`database error: ${error.message}`, 500);
+    if (error) {
+      console.error(`[${FN_NAME}] candidates query failed: ${error.message}`);
+      return err("database_error", 500);
+    }
     const candidates = rows as Candidate[];
 
     const toEmbed = candidates.filter((c) => !c.embedding);
@@ -69,10 +85,9 @@ Deno.serve(async (req: Request) => {
       return json({ embedded: 0, skipped: candidates.length, message: "All candidates already have embeddings." });
     }
 
-    let embedded = 0;
     const failures: string[] = [];
     for (const c of toEmbed) {
-      const vec = await embed(candidateDocument(c));
+      const vec = await embed(supabase, candidateDocument(c));
       if (!vec) {
         failures.push(c.slug);
         continue;
@@ -81,8 +96,10 @@ Deno.serve(async (req: Request) => {
         .from("candidates")
         .update({ embedding: JSON.stringify(vec) })
         .eq("id", c.id);
-      if (upErr) failures.push(c.slug);
-      else embedded++;
+      if (upErr) {
+        console.error(`[${FN_NAME}] embedding update failed for ${c.slug}: ${upErr.message}`);
+        failures.push(c.slug);
+      } else embedded++;
     }
 
     if (embedded === 0) {
@@ -94,6 +111,8 @@ Deno.serve(async (req: Request) => {
 
     return json({ embedded, skipped: candidates.length - toEmbed.length, failures });
   } catch (e) {
-    return err(e instanceof Error ? e.message : "unknown error");
+    if (e instanceof HttpError) return json({ error: e.message, embedded }, e.status);
+    console.error(`[${FN_NAME}] unhandled error:`, e);
+    return err("internal_error");
   }
 });

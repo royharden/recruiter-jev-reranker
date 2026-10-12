@@ -1,8 +1,9 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import { z } from "npm:zod@3.23.8";
-import type { JevAnswer, RoleSpec, SubScores } from "./types.ts";
+import type { RoleSpec, SubScores } from "./types.ts";
+import { checkUsage, HttpError, readJsonBody, serviceClient } from "./guards.ts";
+import { invalidField, roleSpecSchema } from "./spec.ts";
 
-const DAILY_LIMIT = 200;
 const FN_NAME = "explain";
 
 const corsHeaders = {
@@ -18,12 +19,54 @@ function err(message: string, status = 500) {
   return json({ error: message }, status);
 }
 
-async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Response | null> {
-  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
-  if (error || typeof data !== "number") return json({ error: "usage_check_failed" }, 503);
-  if (data > DAILY_LIMIT) return json({ error: "daily_limit" }, 429);
-  return null;
-}
+// Bounded request body: every field that reaches the prompt has an item and character cap.
+const probabilitiesSchema = z.record(z.string().max(300), z.number())
+  .refine((p) => Object.keys(p).length <= 16, "too many probabilities");
+const answerSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("noul"), noul: z.number() }),
+  z.object({
+    type: z.literal("choice"),
+    choice: z.string().max(40),
+    confidence: z.number().optional(),
+    probabilities: probabilitiesSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("score"),
+    score: z.number(),
+    confidence: z.number().optional(),
+    legend: z.array(z.string().max(300)).max(16).optional(),
+    probabilities: probabilitiesSchema.optional(),
+  }),
+]);
+type Answer = z.infer<typeof answerSchema>;
+
+const bodySchema = z.object({
+  query_spec: roleSpecSchema,
+  candidate: z.object({
+    headline: z.string().max(300),
+    skills: z.array(z.string().max(80)).max(60),
+    experience: z.array(z.object({
+      title: z.string().max(200),
+      company: z.string().max(200),
+      summary: z.string().max(2000),
+    })).max(20),
+    location: z.string().max(200).optional(),
+    remote_preference: z.string().max(20).optional(),
+    summary: z.string().max(4000).optional(),
+  }),
+  subscores: z.object({
+    skills: z.number(),
+    seniority: z.number(),
+    location: z.number(),
+    domain: z.number(),
+    total_years: z.number(),
+  }),
+  composite: z.number(),
+  answers: z.record(z.string().max(40), answerSchema)
+    .refine((a) => Object.keys(a).length <= 32, "too many answers")
+    .default({}),
+  llm_mode: z.enum(["live", "mock"]).default("live"),
+});
 
 const explanationSchema = z.object({
   why: z.string(),
@@ -33,11 +76,17 @@ const explanationSchema = z.object({
 
 const SYSTEM_PROMPT = `You explain a candidate's ranking to a recruiter in 2-3 sentences. You are given the role spec, the candidate's code-built profile (no name, no email), computed sub-scores, and the composite. Cite ONLY facts from the profile and the sub-scores — never invent experience. Return ONLY JSON: {"why": string (2-3 sentences), "strengths": string[] (max 4), "gaps": string[] (max 4)}.`;
 
-async function callOpenAi(body: Record<string, unknown>): Promise<{ why: string; strengths: string[]; gaps: string[] } | null> {
+// The daily cap is checked right before the paid fetch; a cap hit or failed usage check
+// throws HttpError so the request stops instead of falling back.
+async function callOpenAi(
+  supabase: SupabaseClient,
+  body: Record<string, unknown>,
+): Promise<{ why: string; strengths: string[]; gaps: string[] } | null> {
   const key = Deno.env.get("OPENAI_API_KEY");
   if (!key) return null;
   const base = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
   const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-6-luna";
+  await checkUsage(supabase, FN_NAME);
   try {
     const res = await fetch(`${base}/chat/completions`, {
       method: "POST",
@@ -51,13 +100,17 @@ async function callOpenAi(body: Record<string, unknown>): Promise<{ why: string;
         response_format: { type: "json_object" },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.error(`[${FN_NAME}] OpenAI error ${res.status}: ${(await res.text().catch(() => "")).slice(0, 500)}`);
+      return null;
+    }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
     if (!content) return null;
     const parsed = explanationSchema.safeParse(JSON.parse(content));
     return parsed.success ? parsed.data : null;
-  } catch {
+  } catch (e) {
+    console.error(`[${FN_NAME}] OpenAI request failed:`, e);
     return null;
   }
 }
@@ -66,7 +119,7 @@ function mockExplain(
   spec: RoleSpec,
   candidate: { headline: string; skills: string[]; experience: { title: string; summary: string }[] },
   subscores: SubScores,
-  answers: Record<string, JevAnswer>,
+  answers: Record<string, Answer>,
   composite: number,
 ): { why: string; strengths: string[]; gaps: string[] } {
   const strengths: string[] = [];
@@ -112,28 +165,28 @@ function mockExplain(
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
+  const supabase = serviceClient();
+  if (!supabase) return err("server_not_configured", 503);
   try {
-    const { query_spec, candidate, subscores, composite, answers, llm_mode = "live" } = await req.json();
-    if (!query_spec || !candidate || !subscores) return err("query_spec, candidate, and subscores are required", 422);
-
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
-
-    const usageResponse = await checkUsage(supabase);
-    if (usageResponse) return usageResponse;
+    const raw = await readJsonBody(req);
+    const r = raw as Record<string, unknown> | null;
+    if (!r?.query_spec || !r.candidate || !r.subscores) return err("query_spec, candidate, and subscores are required", 422);
+    const body = bodySchema.safeParse(raw);
+    if (!body.success) return err(invalidField(body.error), 422);
+    const { query_spec, candidate, subscores, composite, answers, llm_mode } = body.data;
 
     if (llm_mode === "mock") {
-      return json({ explanation: mockExplain(query_spec, candidate, subscores, answers ?? {}, composite), mode: "mock" });
+      return json({ explanation: mockExplain(query_spec, candidate, subscores, answers, composite), mode: "mock" });
     }
 
-    const live = await callOpenAi({ query_spec, candidate, subscores, composite, answers });
+    const live = await callOpenAi(supabase, { query_spec, candidate, subscores, composite, answers });
     if (!live) {
-      return json({ explanation: mockExplain(query_spec, candidate, subscores, answers ?? {}, composite), mode: "mock_fallback" });
+      return json({ explanation: mockExplain(query_spec, candidate, subscores, answers, composite), mode: "mock_fallback" });
     }
     return json({ explanation: live, mode: "live" });
   } catch (e) {
-    return err(e instanceof Error ? e.message : "unknown error");
+    if (e instanceof HttpError) return err(e.message, e.status);
+    console.error(`[${FN_NAME}] unhandled error:`, e);
+    return err("internal_error");
   }
 });

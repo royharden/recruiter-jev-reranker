@@ -1,10 +1,16 @@
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
+import { z } from "npm:zod@3.23.8";
 import type { Candidate, JevCandidateResult, JevState, RoleSpec } from "./types.ts";
 import { totalYears } from "./ranking.ts";
+import { checkUsage, HttpError, readJsonBody, serviceClient } from "./guards.ts";
+import { invalidField, roleSpecSchema } from "./spec.ts";
 
-const DAILY_LIMIT = 200;
 const FN_NAME = "jev-rerank";
 const MAX_CANDIDATES = 40;
+const MAX_ATTEMPTS = 2;
+// Every Candidate field except the embedding vector.
+const CANDIDATE_COLUMNS =
+  "id, slug, full_name, initials, headline, city, country, utc_offset, remote_preference, open_to_relocate, work_authorization, skills, experience, education, summary, email";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,19 +25,20 @@ function err(message: string, status = 500) {
   return json({ error: message }, status);
 }
 
-async function checkUsage(supabase: ReturnType<typeof createClient>): Promise<Response | null> {
-  const { data, error } = await supabase.rpc("increment_usage", { fn_name: FN_NAME });
-  if (error || typeof data !== "number") return json({ error: "usage_check_failed" }, 503);
-  if (data > DAILY_LIMIT) return json({ error: "daily_limit" }, 429);
-  return null;
-}
-
-class DailyLimitStop extends Error {
-  constructor() {
-    super("daily_limit");
-    this.name = "DailyLimitStop";
+// Error whose message is safe to show the client (no upstream response text).
+class UpstreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamError";
   }
 }
+
+const bodySchema = z.object({
+  query_spec: roleSpecSchema,
+  candidate_ids: z.array(z.string().uuid()).min(1).max(MAX_CANDIDATES),
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const JEV_MODEL = "jev-1.13.0";
 const COST_PER_INPUT_TOKEN = 0.042 / 1_000_000;
@@ -127,38 +134,47 @@ function buildQuestions(spec: RoleSpec) {
   return questions;
 }
 
+// At most MAX_ATTEMPTS fetches, retrying only on 429/529 or a network error. Each fetch,
+// retries included, is counted against the daily cap first; a cap hit or failed usage
+// check throws HttpError, so nothing is retried after daily_limit.
 async function callJev(
   request: unknown,
   apiKey: string,
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
 ): Promise<Response> {
   const base = "https://api.typesafe.ai/v1/systemone";
   let delay = 500;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const usageResponse = await checkUsage(supabase);
-    if (usageResponse) throw new DailyLimitStop();
-    const res = await fetch(base, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-    });
-    if (res.status === 429 || res.status === 529) {
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, delay));
-        delay *= 2;
-        continue;
-      }
+  for (let attempt = 1; ; attempt++) {
+    await checkUsage(supabase, FN_NAME);
+    let res: Response;
+    try {
+      res = await fetch(base, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+    } catch (e) {
+      console.error(`[${FN_NAME}] TypeSafe request failed (attempt ${attempt}):`, e);
+      if (attempt >= MAX_ATTEMPTS) throw new UpstreamError("TypeSafe request failed");
+      await sleep(delay);
+      delay *= 2;
+      continue;
+    }
+    if ((res.status === 429 || res.status === 529) && attempt < MAX_ATTEMPTS) {
+      await res.body?.cancel();
+      await sleep(delay);
+      delay *= 2;
+      continue;
     }
     return res;
   }
-  throw new Error("unreachable");
 }
 
 async function rerankOne(
   spec: RoleSpec,
   c: Candidate,
   apiKey: string,
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
 ): Promise<JevCandidateResult> {
   const state = buildState(spec, c);
   const questions = buildQuestions(spec);
@@ -168,9 +184,16 @@ async function rerankOne(
   const latency_ms = Math.round(performance.now() - started);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`TypeSafe API error ${res.status}: ${text.slice(0, 300)}`);
+    console.error(`[${FN_NAME}] TypeSafe API error ${res.status} for ${c.slug}: ${text.slice(0, 500)}`);
+    throw new UpstreamError(`TypeSafe API error ${res.status}`);
   }
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    console.error(`[${FN_NAME}] TypeSafe response for ${c.slug} was not JSON:`, e);
+    throw new UpstreamError("invalid TypeSafe response");
+  }
   return {
     answers: data.answers ?? {},
     model: data.model ?? JEV_MODEL,
@@ -181,66 +204,72 @@ async function rerankOne(
   };
 }
 
+// Runs fn over items with bounded concurrency. The first HttpError (daily_limit or a failed
+// usage check) stops every worker from starting another item and is returned as `stop`.
 async function pool<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,
-  shouldStop: () => boolean,
-): Promise<PromiseSettledResult<R>[]> {
-  const results: PromiseSettledResult<R>[] = new Array(items.length);
+): Promise<{ settled: PromiseSettledResult<R>[]; stop: HttpError | null }> {
+  const settled: PromiseSettledResult<R>[] = new Array(items.length);
   let next = 0;
+  let stop: HttpError | null = null;
   async function worker() {
-    while (!shouldStop() && next < items.length) {
+    while (!stop && next < items.length) {
       const i = next++;
       try {
-        results[i] = { status: "fulfilled", value: await fn(items[i]) };
+        settled[i] = { status: "fulfilled", value: await fn(items[i]) };
       } catch (e) {
-        results[i] = { status: "rejected", reason: e };
-        if (e instanceof DailyLimitStop) break;
+        settled[i] = { status: "rejected", reason: e };
+        if (e instanceof HttpError) stop = e;
       }
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
+  return { settled, stop };
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
+  const supabase = serviceClient();
+  if (!supabase) return err("server_not_configured", 503);
   try {
     const apiKey = Deno.env.get("TYPESAFE_API_KEY");
     if (!apiKey) return err("TYPESAFE_API_KEY is not configured as an Edge Function secret", 500);
 
-    const { query_spec, candidates } = await req.json();
-    if (!query_spec || !Array.isArray(candidates)) return err("query_spec and candidates[] are required", 422);
-    if (candidates.length === 0) return err("candidates[] is empty", 422);
-    if (candidates.length > MAX_CANDIDATES) return json({ error: "too_many_candidates" }, 422);
+    const raw = await readJsonBody(req);
+    const r = raw as Record<string, unknown> | null;
+    if (!r?.query_spec || !Array.isArray(r.candidate_ids)) return err("query_spec and candidate_ids[] are required", 422);
+    if (r.candidate_ids.length === 0) return err("candidate_ids[] is empty", 422);
+    if (r.candidate_ids.length > MAX_CANDIDATES) return json({ error: "too_many_candidates" }, 422);
+    const body = bodySchema.safeParse(raw);
+    if (!body.success) return err(invalidField(body.error), 422);
+    const { query_spec } = body.data;
+    const ids = [...new Set(body.data.candidate_ids)];
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
-
-    let stopped = false;
-    const started = performance.now();
-    const settled = await pool(
-      candidates as Candidate[],
-      8,
-      (c) => rerankOne(query_spec, c, apiKey, supabase),
-      () => stopped,
-    );
-
-    const dailyLimitHit = settled.some(
-      (r) => r.status === "rejected" && r.reason instanceof DailyLimitStop,
-    );
-    if (dailyLimitHit) {
-      return json({ error: "daily_limit" }, 429);
+    // Candidate profiles come from the database, never from the request body.
+    const { data: rows, error } = await supabase.from("candidates").select(CANDIDATE_COLUMNS).in("id", ids);
+    if (error) {
+      console.error(`[${FN_NAME}] candidates query failed: ${error.message}`);
+      return err("database_error", 500);
     }
+    const byId = new Map((rows as unknown as Candidate[]).map((c) => [c.id, c]));
+    const candidates = ids.map((id) => byId.get(id)).filter((c): c is Candidate => c !== undefined);
+    const errors: string[] = ids.filter((id) => !byId.has(id)).map((id) => `${id}: unknown candidate`);
+    if (candidates.length === 0) return err("no matching candidates", 422);
+
+    const started = performance.now();
+    const { settled, stop } = await pool(candidates, 8, (c) => rerankOne(query_spec, c, apiKey, supabase));
+    if (stop) return err(stop.message, stop.status);
 
     const results: (JevCandidateResult & { candidate_id: string })[] = [];
-    const errors: string[] = [];
     settled.forEach((r, i) => {
-      if (r.status === "fulfilled") results.push({ ...r.value, candidate_id: (candidates[i] as Candidate).id });
-      else errors.push(`${(candidates[i] as Candidate).slug}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+      if (r.status === "fulfilled") {
+        results.push({ ...r.value, candidate_id: candidates[i].id });
+        return;
+      }
+      if (!(r.reason instanceof UpstreamError)) console.error(`[${FN_NAME}] rerank failed for ${candidates[i].slug}:`, r.reason);
+      errors.push(`${candidates[i].slug}: ${r.reason instanceof UpstreamError ? r.reason.message : "rerank failed"}`);
     });
 
     if (results.length === 0) {
@@ -254,6 +283,8 @@ Deno.serve(async (req: Request) => {
       total_latency_ms: Math.round(performance.now() - started),
     });
   } catch (e) {
-    return err(e instanceof Error ? e.message : "unknown error");
+    if (e instanceof HttpError) return err(e.message, e.status);
+    console.error(`[${FN_NAME}] unhandled error:`, e);
+    return err("internal_error");
   }
 });

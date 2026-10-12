@@ -23,11 +23,15 @@ export class FunctionError extends Error {
   }
 }
 
-export async function invokeFunction<T>(name: string, body: Record<string, unknown>): Promise<T> {
+export async function invokeFunction<T>(
+  name: string,
+  body: Record<string, unknown>,
+  headers?: Record<string, string>,
+): Promise<T> {
   if (!supabase) {
     throw new FunctionError('Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your environment.');
   }
-  const { data, error } = await supabase.functions.invoke(name, { body });
+  const { data, error } = await supabase.functions.invoke(name, { body, headers });
   if (error) {
     let errMsg = error.message;
     try {
